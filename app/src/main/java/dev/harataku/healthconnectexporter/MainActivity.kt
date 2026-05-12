@@ -1,6 +1,9 @@
 package dev.harataku.healthconnectexporter
 
 import android.content.Intent
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
 import android.net.Uri
 import android.os.Bundle
 import android.view.Gravity
@@ -24,23 +27,36 @@ import androidx.health.connect.client.request.ReadRecordsRequest
 import androidx.health.connect.client.time.TimeRangeFilter
 import androidx.lifecycle.lifecycleScope
 import java.io.IOException
+import java.net.HttpURLConnection
+import java.net.URL
 import java.time.Duration
 import java.time.Instant
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
+import org.json.JSONObject
 
 class MainActivity : ComponentActivity() {
     private lateinit var requestPermissions: ActivityResultLauncher<Set<String>>
     private lateinit var statusView: TextView
+    private lateinit var versionView: TextView
     private lateinit var rangeView: TextView
     private lateinit var activeCaloriesView: TextView
     private lateinit var totalCaloriesView: TextView
     private lateinit var stepsView: TextView
     private lateinit var detailView: TextView
+    private lateinit var updateStatusView: TextView
     private lateinit var permissionButton: Button
     private lateinit var refreshButton: Button
-    private lateinit var updateButton: Button
+    private lateinit var shareButton: Button
+    private lateinit var copyButton: Button
+    private lateinit var healthConnectUpdateButton: Button
+    private lateinit var checkAppUpdateButton: Button
+    private lateinit var openAppUpdateButton: Button
+    private var latestSnapshot: HealthSnapshot? = null
+    private var latestRelease: AppRelease? = null
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -73,11 +89,13 @@ class MainActivity : ComponentActivity() {
         })
 
         statusView = content.label("Status: checking Health Connect")
+        versionView = content.label("App version: ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})")
         rangeView = content.label("Range: not queried yet")
         activeCaloriesView = content.label("Active calories: not loaded")
         totalCaloriesView = content.label("Total calories: not loaded")
         stepsView = content.label("Steps: not loaded")
         detailView = content.label("Details: waiting")
+        updateStatusView = content.label("App update: not checked")
 
         permissionButton = content.button("Request Health Connect permissions") {
             requestPermissions.launch(PERMISSIONS)
@@ -85,9 +103,25 @@ class MainActivity : ComponentActivity() {
         refreshButton = content.button("Refresh last 7 days") {
             readHealthConnectData()
         }
-        updateButton = content.button("Open Health Connect in Play Store") {
+        shareButton = content.button("Share latest summary") {
+            shareLatestSnapshot()
+        }
+        copyButton = content.button("Copy latest summary") {
+            copyLatestSnapshot()
+        }
+        healthConnectUpdateButton = content.button("Open Health Connect in Play Store") {
             openHealthConnectInstallOrUpdate()
         }
+        checkAppUpdateButton = content.button("Check for app update") {
+            checkForAppUpdate()
+        }
+        openAppUpdateButton = content.button("Open latest APK download") {
+            openLatestAppUpdate()
+        }
+
+        shareButton.isEnabled = false
+        copyButton.isEnabled = false
+        openAppUpdateButton.isEnabled = false
 
         return ScrollView(this).apply {
             clipToPadding = false
@@ -147,18 +181,18 @@ class MainActivity : ComponentActivity() {
                 statusView.text = "Status: Health Connect is unavailable on this device."
                 permissionButton.isEnabled = false
                 refreshButton.isEnabled = false
-                updateButton.isEnabled = false
+                healthConnectUpdateButton.isEnabled = false
             }
 
             HealthConnectClient.SDK_UNAVAILABLE_PROVIDER_UPDATE_REQUIRED -> {
                 statusView.text = "Status: Health Connect needs to be installed or updated."
                 permissionButton.isEnabled = false
                 refreshButton.isEnabled = false
-                updateButton.isEnabled = true
+                healthConnectUpdateButton.isEnabled = true
             }
 
             HealthConnectClient.SDK_AVAILABLE -> {
-                updateButton.isEnabled = false
+                healthConnectUpdateButton.isEnabled = false
                 lifecycleScope.launch {
                     val client = HealthConnectClient.getOrCreate(this@MainActivity)
                     val granted = client.permissionController.getGrantedPermissions()
@@ -176,6 +210,8 @@ class MainActivity : ComponentActivity() {
         lifecycleScope.launch {
             statusView.text = "Status: reading Health Connect"
             refreshButton.isEnabled = false
+            shareButton.isEnabled = false
+            copyButton.isEnabled = false
 
             val client = HealthConnectClient.getOrCreate(this@MainActivity)
             val granted = client.permissionController.getGrantedPermissions()
@@ -270,7 +306,11 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun renderSnapshot(snapshot: HealthSnapshot) {
-        val formatter = DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm").withZone(ZoneId.systemDefault())
+        latestSnapshot = snapshot
+        shareButton.isEnabled = true
+        copyButton.isEnabled = true
+
+        val formatter = displayFormatter()
         val activeText = snapshot.activeAggregateKilocalories?.let { formatNumber(it) } ?: "no aggregate data"
         val totalText = when {
             !snapshot.totalCaloriesPermissionGranted -> "permission not granted"
@@ -300,7 +340,9 @@ class MainActivity : ComponentActivity() {
         detailView.text = "Details: granted ${granted.size} of ${PERMISSIONS.size} requested Health Connect permissions."
         permissionButton.isEnabled = true
         refreshButton.isEnabled = false
-        updateButton.isEnabled = false
+        healthConnectUpdateButton.isEnabled = false
+        shareButton.isEnabled = latestSnapshot != null
+        copyButton.isEnabled = latestSnapshot != null
     }
 
     private fun openHealthConnectInstallOrUpdate() {
@@ -312,7 +354,142 @@ class MainActivity : ComponentActivity() {
         })
     }
 
+    private fun checkForAppUpdate() {
+        lifecycleScope.launch {
+            updateStatusView.text = "App update: checking GitHub Releases"
+            checkAppUpdateButton.isEnabled = false
+            openAppUpdateButton.isEnabled = false
+
+            runCatching { fetchLatestRelease() }
+                .onSuccess { release ->
+                    latestRelease = release
+                    val comparison = compareVersionNames(release.versionName, BuildConfig.VERSION_NAME)
+                    updateStatusView.text = when {
+                        comparison > 0 -> "App update: ${release.versionName} is available. Current version is ${BuildConfig.VERSION_NAME}."
+                        comparison == 0 -> "App update: ${release.versionName} is the current version."
+                        else -> "App update: latest release ${release.versionName} is older than this build (${BuildConfig.VERSION_NAME})."
+                    }
+                    openAppUpdateButton.isEnabled = comparison > 0 && release.apkUrl.isNotBlank()
+                }
+                .onFailure { error ->
+                    latestRelease = null
+                    updateStatusView.text = "App update: check failed (${error.message ?: error.javaClass.simpleName})."
+                }
+
+            checkAppUpdateButton.isEnabled = true
+        }
+    }
+
+    private suspend fun fetchLatestRelease(): AppRelease = withContext(Dispatchers.IO) {
+        val connection = (URL(LATEST_RELEASE_API_URL).openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = 10_000
+            readTimeout = 10_000
+            setRequestProperty("Accept", "application/vnd.github+json")
+            setRequestProperty("X-GitHub-Api-Version", "2022-11-28")
+            setRequestProperty("User-Agent", "HealthConnectExporter/${BuildConfig.VERSION_NAME}")
+        }
+
+        try {
+            val responseCode = connection.responseCode
+            if (responseCode !in 200..299) {
+                throw IOException("GitHub returned HTTP $responseCode")
+            }
+            val body = connection.inputStream.bufferedReader().use { it.readText() }
+            val json = JSONObject(body)
+            val assets = json.getJSONArray("assets")
+            val apkAsset = (0 until assets.length())
+                .map { assets.getJSONObject(it) }
+                .firstOrNull { asset -> asset.optString("name").endsWith(".apk", ignoreCase = true) }
+                ?: throw IOException("latest release has no APK asset")
+
+            AppRelease(
+                versionName = json.optString("tag_name").removePrefix("v"),
+                releaseUrl = json.optString("html_url"),
+                apkUrl = apkAsset.optString("browser_download_url"),
+                apkName = apkAsset.optString("name")
+            )
+        } finally {
+            connection.disconnect()
+        }
+    }
+
+    private fun openLatestAppUpdate() {
+        val release = latestRelease ?: return
+        val url = release.apkUrl.ifBlank { release.releaseUrl }
+        startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+    }
+
+    private fun shareLatestSnapshot() {
+        val summary = latestSnapshot?.toShareText() ?: return
+        val sendIntent = Intent(Intent.ACTION_SEND).apply {
+            type = "text/plain"
+            putExtra(Intent.EXTRA_SUBJECT, "Health Connect summary")
+            putExtra(Intent.EXTRA_TEXT, summary)
+        }
+        startActivity(Intent.createChooser(sendIntent, "Share Health Connect summary"))
+    }
+
+    private fun copyLatestSnapshot() {
+        val summary = latestSnapshot?.toShareText() ?: return
+        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        clipboard.setPrimaryClip(ClipData.newPlainText("Health Connect summary", summary))
+        statusView.text = "Status: latest summary copied"
+    }
+
+    private fun HealthSnapshot.toShareText(): String {
+        val formatter = displayFormatter()
+        val activeText = activeAggregateKilocalories?.let { "${formatNumber(it)} kcal" } ?: "no aggregate data"
+        val totalText = when {
+            !totalCaloriesPermissionGranted -> "permission not granted"
+            totalKilocalories == null -> "no aggregate data"
+            else -> "${formatNumber(totalKilocalories)} kcal"
+        }
+        val stepsText = when {
+            !stepsPermissionGranted -> "permission not granted"
+            steps == null -> "no aggregate data"
+            else -> "%,d".format(steps)
+        }
+
+        return """
+            Health Connect summary
+            Range: ${formatter.format(startTime)} to ${formatter.format(endTime)}
+            Active calories: $activeText
+            Total calories: $totalText
+            Steps: $stepsText
+            Active calorie records: $activeRecordCount
+        """.trimIndent()
+    }
+
+    private fun compareVersionNames(left: String, right: String): Int {
+        val leftParts = left.versionParts()
+        val rightParts = right.versionParts()
+        val maxSize = maxOf(leftParts.size, rightParts.size)
+        for (index in 0 until maxSize) {
+            val difference = (leftParts.getOrNull(index) ?: 0) - (rightParts.getOrNull(index) ?: 0)
+            if (difference != 0) {
+                return difference
+            }
+        }
+        return 0
+    }
+
+    private fun String.versionParts(): List<Int> =
+        trim().removePrefix("v").split(".", "-", "_").mapNotNull { part ->
+            part.takeWhile { it.isDigit() }.toIntOrNull()
+        }
+
+    private fun displayFormatter(): DateTimeFormatter =
+        DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm").withZone(ZoneId.systemDefault())
+
     private fun formatNumber(value: Double): String = "%,.1f".format(value)
+
+    private data class AppRelease(
+        val versionName: String,
+        val releaseUrl: String,
+        val apkUrl: String,
+        val apkName: String
+    )
 
     private data class HealthSnapshot(
         val startTime: Instant,
@@ -328,6 +505,7 @@ class MainActivity : ComponentActivity() {
 
     private companion object {
         private const val HEALTH_CONNECT_PROVIDER_PACKAGE = "com.google.android.apps.healthdata"
+        private const val LATEST_RELEASE_API_URL = "https://api.github.com/repos/haratak/health-connect-exporter/releases/latest"
         private val ACTIVE_CALORIES_PERMISSION = HealthPermission.getReadPermission(ActiveCaloriesBurnedRecord::class)
         private val TOTAL_CALORIES_PERMISSION = HealthPermission.getReadPermission(TotalCaloriesBurnedRecord::class)
         private val STEPS_PERMISSION = HealthPermission.getReadPermission(StepsRecord::class)

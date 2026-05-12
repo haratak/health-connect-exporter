@@ -10,6 +10,24 @@ Minimal Android app for verifying that Health Connect data can be retrieved from
 
 The app shows the queried time range, aggregate totals, the number of active calorie records read, and clear unavailable, permission, no-data, and error states.
 
+## App Updates
+
+The app includes a GitHub Releases based update check. Tap `Check for app update` to fetch the latest release metadata from:
+
+```text
+https://github.com/haratak/health-connect-exporter/releases/latest
+```
+
+If a newer release with an APK asset is available, tap `Open latest APK download`. Android opens the GitHub-hosted APK URL in the browser/download flow, then the OS asks the user to confirm installation. The app does not silently install updates, bypass Android install prompts, or embed GitHub tokens.
+
+The repository is public so installed APKs can check release metadata and download release assets without credentials. GitHub Actions artifacts are still uploaded for CI convenience, but release APKs are the durable update source because artifacts expire and private artifacts require authentication.
+
+## Sharing
+
+After `Refresh last 7 days` succeeds, tap `Share latest summary` to send the displayed range, active calories, total calories, steps, and active calorie record count through Android Sharesheet. Discord can be selected there when it is installed. Tap `Copy latest summary` to place the same text on the clipboard.
+
+Sharing is always user-initiated. The app does not automatically upload, sync, or post Health Connect data.
+
 ## Device Requirements
 
 - Android 14 or newer includes Health Connect as a framework module.
@@ -41,7 +59,7 @@ If the app reports no data, confirm that another app has written active calorie 
 
 ## GitHub Actions APK
 
-Every push to `main` runs `.github/workflows/android-apk.yml`, builds `assembleDebug`, and uploads `app-debug.apk` as an artifact named `health-connect-exporter-debug-apk`.
+Every push to `main` runs `.github/workflows/android-apk.yml`, builds `assembleDebug`, and uploads a debug APK artifact named `health-connect-exporter-debug-apk`.
 
 To download it:
 
@@ -50,6 +68,8 @@ To download it:
 3. Open the latest `Android APK` workflow run.
 4. Download the `health-connect-exporter-debug-apk` artifact.
 
+For release updates, push a version tag such as `v0.2.0`. The same workflow builds the APK and creates or updates a GitHub Release with an APK named `health-connect-exporter-v0.2.0.apk`.
+
 ## Privacy
 
-This milestone only reads Health Connect data on-device and displays it in the app. It does not send health data to a server, write Health Connect data, or store exported health data in the repository.
+Health Connect data is read on-device and displayed in the app. The app only shares data after an explicit tap on the system Sharesheet or copy action. It does not send health data to a server, write Health Connect data, or store exported health data in the repository.
