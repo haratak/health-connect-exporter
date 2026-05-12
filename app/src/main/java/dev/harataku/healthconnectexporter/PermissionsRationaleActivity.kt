@@ -5,6 +5,8 @@ import android.os.Bundle
 import android.view.Gravity
 import android.widget.LinearLayout
 import android.widget.TextView
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 
 class PermissionsRationaleActivity : Activity() {
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -24,5 +26,16 @@ class PermissionsRationaleActivity : Activity() {
         })
 
         setContentView(layout)
+        ViewCompat.setOnApplyWindowInsetsListener(layout) { view, insets ->
+            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            view.setPadding(
+                padding + bars.left,
+                padding + bars.top,
+                padding + bars.right,
+                padding + bars.bottom
+            )
+            insets
+        }
+        ViewCompat.requestApplyInsets(layout)
     }
 }

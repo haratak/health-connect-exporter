@@ -22,5 +22,6 @@ android {
 
 dependencies {
     implementation("androidx.activity:activity-ktx:1.12.0")
+    implementation("androidx.core:core-ktx:1.17.0")
     implementation("androidx.health.connect:connect-client:1.1.0")
 }

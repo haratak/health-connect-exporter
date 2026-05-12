@@ -11,6 +11,8 @@ import android.widget.ScrollView
 import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.activity.result.ActivityResultLauncher
+import androidx.core.view.ViewCompat
+import androidx.core.view.WindowInsetsCompat
 import androidx.health.connect.client.HealthConnectClient
 import androidx.health.connect.client.PermissionController
 import androidx.health.connect.client.permission.HealthPermission
@@ -88,8 +90,24 @@ class MainActivity : ComponentActivity() {
         }
 
         return ScrollView(this).apply {
+            clipToPadding = false
             addView(content)
+            applySystemBarInsets(padding)
         }
+    }
+
+    private fun ScrollView.applySystemBarInsets(basePadding: Int) {
+        ViewCompat.setOnApplyWindowInsetsListener(this) { view, insets ->
+            val bars = insets.getInsets(WindowInsetsCompat.Type.systemBars())
+            view.setPadding(
+                basePadding + bars.left,
+                basePadding + bars.top,
+                basePadding + bars.right,
+                basePadding + bars.bottom
+            )
+            insets
+        }
+        ViewCompat.requestApplyInsets(this)
     }
 
     private fun LinearLayout.label(textValue: String): TextView {
