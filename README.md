@@ -46,6 +46,27 @@ The debug APK is generated at:
 app/build/outputs/apk/debug/app-debug.apk
 ```
 
+Release builds require the release signing keystore and passwords to be provided through environment variables:
+
+```text
+ANDROID_RELEASE_STORE_FILE
+ANDROID_RELEASE_STORE_PASSWORD
+ANDROID_RELEASE_KEY_ALIAS
+ANDROID_RELEASE_KEY_PASSWORD
+```
+
+With those variables set, run:
+
+```bash
+./gradlew assembleRelease
+```
+
+The signed release APK is generated at:
+
+```text
+app/build/outputs/apk/release/app-release.apk
+```
+
 ## Install And Test
 
 1. Install the debug APK on an Android device.
@@ -57,7 +78,7 @@ app/build/outputs/apk/debug/app-debug.apk
 
 If the app reports no data, confirm that another app has written active calorie data to Health Connect in the queried period.
 
-## GitHub Actions APK
+## GitHub Actions APKs
 
 Every push to `main` runs `.github/workflows/android-apk.yml`, builds `assembleDebug`, and uploads a debug APK artifact named `health-connect-exporter-debug-apk`.
 
@@ -68,7 +89,9 @@ To download it:
 3. Open the latest `Android APK` workflow run.
 4. Download the `health-connect-exporter-debug-apk` artifact.
 
-For release updates, push a version tag such as `v0.2.0`. The same workflow builds the APK and creates or updates a GitHub Release with an APK named `health-connect-exporter-v0.2.0.apk`.
+For release updates, push a version tag such as `v0.2.1`. The same workflow reconstructs the release keystore from GitHub Secrets, runs `assembleRelease`, and creates or updates a GitHub Release with an APK named like `health-connect-exporter-v0.2.1-release.apk`.
+
+Release APKs are signed with the app's release key, not the Android debug key. Android will allow sideloaded updates only when the installed app and the update APK have the same application ID and signing certificate. If a device has a previous debug-signed build installed, uninstall it before installing the release-signed APK; after that, future release APKs signed with the same release key can update in place.
 
 ## Privacy
 
