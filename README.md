@@ -10,6 +10,19 @@ Minimal Android app for verifying that Health Connect data can be retrieved from
 
 The app shows the selected local-date period, queried time range, daily rows, aggregate period totals, the number of active calorie records read, and clear unavailable, permission, no-data, and error states. Days without Health Connect data are still shown as explicit zero/no-data rows.
 
+## Step source breakdown and filtering (v0.2.4)
+
+The app now reads raw `StepsRecord` entries for the selected period and shows a source breakdown by Health Connect writer package. App labels are shown when resolvable, and package names are always shown for clarity.
+
+You can filter step values to one source:
+
+- `All sources` (default)
+- one discovered writer package from the latest period read
+
+Daily step totals, period step totals, and share/copy output now reflect the selected source mode.
+
+Note: the source shown is the Health Connect writer app/package (for example Health Sync, Google Fit, Garmin Connect), not always the physical watch device itself. To avoid likely double counting, choose only one Garmin/Health Sync/Google Fit source that matches the data you want after checking the source breakdown.
+
 ## Period Selection
 
 Use the period buttons to choose `Today`, `Yesterday`, `Last 7 days`, or `Last 30 days`. Tap `Custom date range` to choose a start date and end date with native Android date pickers.

@@ -1,5 +1,6 @@
 package dev.harataku.healthconnectexporter
 
+import android.app.AlertDialog
 import android.app.DatePickerDialog
 import android.content.ActivityNotFoundException
 import android.content.ClipData
@@ -27,6 +28,7 @@ import androidx.health.connect.client.permission.HealthPermission
 import androidx.health.connect.client.records.ActiveCaloriesBurnedRecord
 import androidx.health.connect.client.records.StepsRecord
 import androidx.health.connect.client.records.TotalCaloriesBurnedRecord
+import androidx.health.connect.client.records.metadata.DataOrigin
 import androidx.health.connect.client.request.AggregateRequest
 import androidx.health.connect.client.request.ReadRecordsRequest
 import androidx.health.connect.client.time.TimeRangeFilter
@@ -56,11 +58,14 @@ class MainActivity : ComponentActivity() {
     private lateinit var stepsView: TextView
     private lateinit var dailyRowsView: TextView
     private lateinit var detailView: TextView
+    private lateinit var stepSourceModeView: TextView
+    private lateinit var stepSourceSummaryView: TextView
     private lateinit var updateStatusView: TextView
     private lateinit var permissionButton: Button
     private lateinit var refreshButton: Button
     private lateinit var shareButton: Button
     private lateinit var copyButton: Button
+    private lateinit var stepSourcePickerButton: Button
     private lateinit var healthConnectUpdateButton: Button
     private lateinit var checkAppUpdateButton: Button
     private lateinit var openAppUpdateButton: Button
@@ -69,6 +74,8 @@ class MainActivity : ComponentActivity() {
     private var downloadedUpdateApk: File? = null
     private var isAppUpdateDownloadRunning: Boolean = false
     private var selectedDateRange: LocalDateRange = LocalDateRange.lastDays(7)
+    private var selectedStepSourcePackage: String? = null
+    private var latestStepSourceSummaries: List<StepSourceSummary> = emptyList()
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -108,6 +115,8 @@ class MainActivity : ComponentActivity() {
         totalCaloriesView = content.label("Total calories: not loaded")
         stepsView = content.label("Steps: not loaded")
         dailyRowsView = content.label("Daily rows: not loaded")
+        stepSourceModeView = content.label("Step source mode: All sources")
+        stepSourceSummaryView = content.label("Step source breakdown: not loaded")
         detailView = content.label("Details: waiting")
         updateStatusView = content.label("App update: not checked")
 
@@ -116,6 +125,9 @@ class MainActivity : ComponentActivity() {
         }
         refreshButton = content.button("Refresh selected period") {
             readHealthConnectData()
+        }
+        stepSourcePickerButton = content.button("Select step source") {
+            showStepSourcePicker()
         }
         content.button("Today") {
             selectDateRange(LocalDateRange.today(), refresh = true)
@@ -150,6 +162,7 @@ class MainActivity : ComponentActivity() {
 
         shareButton.isEnabled = false
         copyButton.isEnabled = false
+        stepSourcePickerButton.isEnabled = false
         openAppUpdateButton.isEnabled = false
 
         return ScrollView(this).apply {
@@ -329,14 +342,22 @@ class MainActivity : ComponentActivity() {
         dateRange: LocalDateRange
     ): HealthSnapshot {
         val zoneId = ZoneId.systemDefault()
+        val requestedStepSource = selectedStepSourcePackage
+        val stepSourceSummaries = if (granted.contains(STEPS_PERMISSION)) {
+            readStepSourceSummaries(client, dateRange, zoneId)
+        } else {
+            emptyList()
+        }
         val dailyRows = dateRange.dates().map { date ->
-            readDailyRow(client, granted, date, zoneId)
+            readDailyRow(client, granted, date, zoneId, requestedStepSource)
         }
 
         return HealthSnapshot(
             dateRange = dateRange,
             startTime = dateRange.startInstant(zoneId),
             endTime = dateRange.endInstant(zoneId),
+            stepSourceSummaries = stepSourceSummaries,
+            selectedStepSourcePackage = requestedStepSource,
             dailyRows = dailyRows,
             activeAggregateKilocalories = dailyRows.sumDoubleOrNull { it.activeAggregateKilocalories },
             activeRecordKilocalories = dailyRows.sumOf { it.activeRecordKilocalories },
@@ -360,7 +381,8 @@ class MainActivity : ComponentActivity() {
         client: HealthConnectClient,
         granted: Set<String>,
         date: LocalDate,
-        zoneId: ZoneId
+        zoneId: ZoneId,
+        stepSourcePackage: String?
     ): DailyHealthRow {
         val startTime = date.atStartOfDay(zoneId).toInstant()
         val endTime = date.plusDays(1).atStartOfDay(zoneId).toInstant()
@@ -380,22 +402,44 @@ class MainActivity : ComponentActivity() {
             pageToken = response.pageToken
         } while (pageToken != null)
 
-        val metrics = buildSet {
+        val baseMetrics = buildSet {
             add(ActiveCaloriesBurnedRecord.ACTIVE_CALORIES_TOTAL)
             if (granted.contains(TOTAL_CALORIES_PERMISSION)) {
                 add(TotalCaloriesBurnedRecord.ENERGY_TOTAL)
-            }
-            if (granted.contains(STEPS_PERMISSION)) {
-                add(StepsRecord.COUNT_TOTAL)
             }
         }
 
         val aggregate = client.aggregate(
             AggregateRequest(
-                metrics = metrics,
+                metrics = baseMetrics,
                 timeRangeFilter = TimeRangeFilter.between(startTime, endTime)
             )
         )
+        val stepAggregate = if (granted.contains(STEPS_PERMISSION)) {
+            if (stepSourcePackage != null) {
+                client.aggregate(
+                    AggregateRequest(
+                        metrics = setOf(StepsRecord.COUNT_TOTAL),
+                        timeRangeFilter = TimeRangeFilter.between(startTime, endTime),
+                        dataOriginFilter = setOf(DataOrigin(stepSourcePackage))
+                    )
+                )
+            } else {
+                client.aggregate(
+                    AggregateRequest(
+                        metrics = setOf(StepsRecord.COUNT_TOTAL),
+                        timeRangeFilter = TimeRangeFilter.between(startTime, endTime)
+                    )
+                )
+            }
+        } else {
+            null
+        }
+        val stepsValue = if (granted.contains(STEPS_PERMISSION)) {
+            stepAggregate?.get(StepsRecord.COUNT_TOTAL)
+        } else {
+            null
+        }
 
         return DailyHealthRow(
             date = date,
@@ -408,15 +452,54 @@ class MainActivity : ComponentActivity() {
                 null
             },
             steps = if (granted.contains(STEPS_PERMISSION)) {
-                aggregate[StepsRecord.COUNT_TOTAL]
+                stepsValue
             } else {
                 null
             }
         )
     }
 
+    private suspend fun readStepSourceSummaries(
+        client: HealthConnectClient,
+        dateRange: LocalDateRange,
+        zoneId: ZoneId
+    ): List<StepSourceSummary> {
+        val startTime = dateRange.startInstant(zoneId)
+        val endTime = dateRange.endInstant(zoneId)
+        val summaries = linkedMapOf<String, StepSourceSummary>()
+        var pageToken: String? = null
+
+        do {
+            val response = client.readRecords(
+                ReadRecordsRequest(
+                    recordType = StepsRecord::class,
+                    timeRangeFilter = TimeRangeFilter.between(startTime, endTime),
+                    pageToken = pageToken
+                )
+            )
+
+            response.records.forEach { record ->
+                val packageName = record.metadata.dataOrigin.packageName.ifBlank { "Unknown package" }
+                val existing = summaries[packageName]
+                summaries[packageName] = StepSourceSummary(
+                    packageName = packageName,
+                    displayLabel = resolveStepSourceDisplayLabel(packageName),
+                    stepCount = (existing?.stepCount ?: 0L) + record.count,
+                    recordCount = (existing?.recordCount ?: 0) + 1
+                )
+            }
+            pageToken = response.pageToken
+        } while (pageToken != null)
+
+        return summaries.values.sortedWith(
+            compareByDescending<StepSourceSummary> { it.stepCount }.thenBy { it.displayLabel }
+        )
+    }
+
     private fun renderSnapshot(snapshot: HealthSnapshot) {
         latestSnapshot = snapshot
+        latestStepSourceSummaries = snapshot.stepSourceSummaries
+        selectedStepSourcePackage = snapshot.selectedStepSourcePackage
         shareButton.isEnabled = true
         copyButton.isEnabled = true
 
@@ -430,20 +513,39 @@ class MainActivity : ComponentActivity() {
         val stepsText = when {
             !snapshot.stepsPermissionGranted -> "permission not granted"
             snapshot.steps == null -> "no aggregate data"
+            snapshot.steps == 0L && snapshot.hasSelectedStepSourceNoData() -> "0 (selected source has no records)"
             else -> "%,d".format(snapshot.steps)
         }
+        val stepSourceMode = selectedStepSourceModeLabel(snapshot)
+        val stepSourceBreakdown = snapshot.stepSourceSummaryText()
 
         statusView.text = "Status: read complete"
         selectedPeriodView.text = "Selected period: ${snapshot.dateRange.displayLabel()}"
         rangeView.text = "Range: ${formatter.format(snapshot.startTime)} to ${formatter.format(snapshot.endTime)}"
         activeCaloriesView.text = "Active calories: $activeText kcal"
         totalCaloriesView.text = "Total calories: $totalText"
-        stepsView.text = "Steps: $stepsText"
+        stepsView.text = "Steps ($stepSourceMode): $stepsText"
         dailyRowsView.text = snapshot.dailyRowsText(includeHeader = true)
         detailView.text = if (snapshot.activeRecordCount == 0) {
             "Details: no ActiveCaloriesBurnedRecord entries found in this range."
+        } else if (snapshot.stepsPermissionGranted && snapshot.selectedStepSourcePackage != null && snapshot.hasSelectedStepSourceNoData()) {
+            "Details: ${snapshot.activeRecordCount} active calorie records read; raw record sum ${formatNumber(snapshot.activeRecordKilocalories)} kcal. Selected step source has no records in this period."
+        } else if (snapshot.stepsPermissionGranted && snapshot.stepSourceSummaries.isEmpty()) {
+            "Details: ${snapshot.activeRecordCount} active calorie records read; raw record sum ${formatNumber(snapshot.activeRecordKilocalories)} kcal. No step records found in this period."
         } else {
             "Details: ${snapshot.activeRecordCount} active calorie records read; raw record sum ${formatNumber(snapshot.activeRecordKilocalories)} kcal."
+        }
+        stepSourceModeView.text = "Step source mode: $stepSourceMode"
+        stepSourceSummaryView.text = if (snapshot.stepsPermissionGranted) {
+            "Step source breakdown:\n$stepSourceBreakdown"
+        } else {
+            "Step source breakdown: steps permission not granted"
+        }
+        stepSourcePickerButton.isEnabled = snapshot.stepsPermissionGranted && snapshot.stepSourceSummaries.isNotEmpty()
+        stepSourcePickerButton.text = if (snapshot.selectedStepSourcePackage == null) {
+            "Select step source (all)"
+        } else {
+            "Select step source"
         }
     }
 
@@ -455,6 +557,58 @@ class MainActivity : ComponentActivity() {
         healthConnectUpdateButton.isEnabled = false
         shareButton.isEnabled = latestSnapshot != null
         copyButton.isEnabled = latestSnapshot != null
+        stepSourceModeView.text = "Step source mode: All sources"
+        stepSourceSummaryView.text = "Step source breakdown: steps permission required"
+        stepSourcePickerButton.isEnabled = false
+        latestStepSourceSummaries = emptyList()
+        if (selectedStepSourcePackage != null) {
+            selectedStepSourcePackage = null
+        }
+    }
+
+    private fun showStepSourcePicker() {
+        if (latestStepSourceSummaries.isEmpty()) {
+            statusView.text = "Status: no step source data is available."
+            return
+        }
+
+        val sourceLabels = latestStepSourceSummaries.map { it.displayLabel }
+        val selectable = listOf<String?>(null) + latestStepSourceSummaries.map { it.packageName }
+        var selectedIndex = selectable.indexOf(selectedStepSourcePackage).takeIf { it >= 0 } ?: 0
+
+        AlertDialog.Builder(this).apply {
+            setTitle("Select step source")
+            setSingleChoiceItems(
+                (listOf("All sources") + sourceLabels).toTypedArray(),
+                selectedIndex
+            ) { _, which ->
+                selectedIndex = which
+            }
+            setPositiveButton("Apply") { _, _ ->
+                val newSelection = selectable[selectedIndex]
+                if (newSelection != selectedStepSourcePackage) {
+                    selectedStepSourcePackage = newSelection
+                    readHealthConnectData()
+                }
+            }
+            setNegativeButton("Cancel", null)
+        }.show()
+    }
+
+    private fun resolveStepSourceDisplayLabel(packageName: String): String {
+        if (packageName == "Unknown package") {
+            return packageName
+        }
+        val appLabel = runCatching {
+            packageManager.getApplicationInfo(packageName, 0).let {
+                packageManager.getApplicationLabel(it).toString()
+            }
+        }.getOrNull()
+        return if (appLabel.isNullOrBlank() || appLabel == packageName) {
+            packageName
+        } else {
+            "$appLabel ($packageName)"
+        }
     }
 
     private fun openHealthConnectInstallOrUpdate() {
@@ -708,21 +862,68 @@ class MainActivity : ComponentActivity() {
             steps == null -> "no aggregate data"
             else -> "%,d".format(steps)
         }
+        val stepSourceMode = selectedStepSourceModeLabel(this)
+        val stepSourceBreakdown = stepSourceSummaryTextForShare()
 
         return """
             Health Connect summary
             Period: ${dateRange.displayLabel()}
             Range: ${formatter.format(startTime)} to ${formatter.format(endTime)}
-            
+
+            Step source mode: $stepSourceMode
+            Step source breakdown:
+            $stepSourceBreakdown
+
             Daily rows:
             ${dailyRowsText(includeHeader = false)}
-            
+
             Period totals:
             Active calories: $activeText
             Total calories: $totalText
             Steps: $stepsText
             Active calorie records: $activeRecordCount
         """.trimIndent()
+    }
+
+    private fun selectedStepSourceModeLabel(snapshot: HealthSnapshot): String {
+        val selectedPackage = snapshot.selectedStepSourcePackage ?: return "All sources"
+        val summary = snapshot.stepSourceSummaries.firstOrNull { it.packageName == selectedPackage }
+        return summary?.displayLabel ?: resolveStepSourceDisplayLabel(selectedPackage)
+    }
+
+    private fun HealthSnapshot.hasSelectedStepSourceNoData(): Boolean {
+        val selectedPackage = selectedStepSourcePackage ?: return false
+        return stepSourceSummaries.none { it.packageName == selectedPackage }
+    }
+
+    private fun HealthSnapshot.stepSourceSummaryText(): String {
+        if (!stepsPermissionGranted) {
+            return "permission not granted"
+        }
+        if (stepSourceSummaries.isEmpty()) {
+            return if (selectedStepSourcePackage == null) {
+                "No step records found for selected period."
+            } else {
+                "Selected source has no records for this period."
+            }
+        }
+        return stepSourceSummaries.joinToString("\n") { summary ->
+            "${summary.displayLabel}: ${formatNumber(summary.stepCount.toDouble())} steps (${summary.recordCount} records)"
+        }
+    }
+
+    private fun HealthSnapshot.stepSourceSummaryTextForShare(): String {
+        if (!stepsPermissionGranted) {
+            return "steps permission not granted"
+        }
+        if (stepSourceSummaries.isEmpty()) {
+            return if (selectedStepSourcePackage == null) {
+                "No step records found for selected period."
+            } else {
+                "Selected source has no records for this period."
+            }
+        }
+        return stepSourceSummaryText()
     }
 
     private fun compareVersionNames(left: String, right: String): Int {
@@ -810,6 +1011,8 @@ class MainActivity : ComponentActivity() {
         val dateRange: LocalDateRange,
         val startTime: Instant,
         val endTime: Instant,
+        val stepSourceSummaries: List<StepSourceSummary>,
+        val selectedStepSourcePackage: String?,
         val dailyRows: List<DailyHealthRow>,
         val activeAggregateKilocalories: Double?,
         val activeRecordKilocalories: Double,
@@ -818,6 +1021,13 @@ class MainActivity : ComponentActivity() {
         val totalCaloriesPermissionGranted: Boolean,
         val steps: Long?,
         val stepsPermissionGranted: Boolean
+    )
+
+    private data class StepSourceSummary(
+        val packageName: String,
+        val displayLabel: String,
+        val stepCount: Long,
+        val recordCount: Int
     )
 
     private data class DailyHealthRow(
