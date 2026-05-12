@@ -1,9 +1,10 @@
 package dev.harataku.healthconnectexporter
 
-import android.content.Intent
+import android.app.DatePickerDialog
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.content.Intent
 import android.net.Uri
 import android.os.Bundle
 import android.view.Gravity
@@ -29,8 +30,8 @@ import androidx.lifecycle.lifecycleScope
 import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
-import java.time.Duration
 import java.time.Instant
+import java.time.LocalDate
 import java.time.ZoneId
 import java.time.format.DateTimeFormatter
 import kotlinx.coroutines.Dispatchers
@@ -42,10 +43,12 @@ class MainActivity : ComponentActivity() {
     private lateinit var requestPermissions: ActivityResultLauncher<Set<String>>
     private lateinit var statusView: TextView
     private lateinit var versionView: TextView
+    private lateinit var selectedPeriodView: TextView
     private lateinit var rangeView: TextView
     private lateinit var activeCaloriesView: TextView
     private lateinit var totalCaloriesView: TextView
     private lateinit var stepsView: TextView
+    private lateinit var dailyRowsView: TextView
     private lateinit var detailView: TextView
     private lateinit var updateStatusView: TextView
     private lateinit var permissionButton: Button
@@ -57,6 +60,7 @@ class MainActivity : ComponentActivity() {
     private lateinit var openAppUpdateButton: Button
     private var latestSnapshot: HealthSnapshot? = null
     private var latestRelease: AppRelease? = null
+    private var selectedDateRange: LocalDateRange = LocalDateRange.lastDays(7)
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
@@ -90,18 +94,35 @@ class MainActivity : ComponentActivity() {
 
         statusView = content.label("Status: checking Health Connect")
         versionView = content.label("App version: ${BuildConfig.VERSION_NAME} (${BuildConfig.VERSION_CODE})")
+        selectedPeriodView = content.label("Selected period: ${selectedDateRange.displayLabel()}")
         rangeView = content.label("Range: not queried yet")
         activeCaloriesView = content.label("Active calories: not loaded")
         totalCaloriesView = content.label("Total calories: not loaded")
         stepsView = content.label("Steps: not loaded")
+        dailyRowsView = content.label("Daily rows: not loaded")
         detailView = content.label("Details: waiting")
         updateStatusView = content.label("App update: not checked")
 
         permissionButton = content.button("Request Health Connect permissions") {
             requestPermissions.launch(PERMISSIONS)
         }
-        refreshButton = content.button("Refresh last 7 days") {
+        refreshButton = content.button("Refresh selected period") {
             readHealthConnectData()
+        }
+        content.button("Today") {
+            selectDateRange(LocalDateRange.today(), refresh = true)
+        }
+        content.button("Yesterday") {
+            selectDateRange(LocalDateRange.yesterday(), refresh = true)
+        }
+        content.button("Last 7 days") {
+            selectDateRange(LocalDateRange.lastDays(7), refresh = true)
+        }
+        content.button("Last 30 days") {
+            selectDateRange(LocalDateRange.lastDays(30), refresh = true)
+        }
+        content.button("Custom date range") {
+            pickCustomDateRange()
         }
         shareButton = content.button("Share latest summary") {
             shareLatestSnapshot()
@@ -206,12 +227,64 @@ class MainActivity : ComponentActivity() {
         }
     }
 
+    private fun selectDateRange(range: LocalDateRange, refresh: Boolean) {
+        selectedDateRange = range
+        selectedPeriodView.text = "Selected period: ${range.displayLabel()}"
+        if (refresh) {
+            readHealthConnectData()
+        }
+    }
+
+    private fun pickCustomDateRange() {
+        val currentStart = selectedDateRange.startDate
+        showDatePicker("Start date", currentStart) { startDate ->
+            val suggestedEnd = maxOf(selectedDateRange.endDate, startDate)
+            showDatePicker("End date", suggestedEnd) { endDate ->
+                if (endDate.isBefore(startDate)) {
+                    statusView.text = "Status: custom range end date must be on or after start date."
+                    return@showDatePicker
+                }
+                selectDateRange(LocalDateRange(startDate, endDate), refresh = true)
+            }
+        }
+    }
+
+    private fun showDatePicker(title: String, initialDate: LocalDate, onSelected: (LocalDate) -> Unit) {
+        DatePickerDialog(
+            this,
+            { _, year, month, dayOfMonth ->
+                onSelected(LocalDate.of(year, month + 1, dayOfMonth))
+            },
+            initialDate.year,
+            initialDate.monthValue - 1,
+            initialDate.dayOfMonth
+        ).apply {
+            setTitle(title)
+            show()
+        }
+    }
+
     private fun readHealthConnectData() {
         lifecycleScope.launch {
-            statusView.text = "Status: reading Health Connect"
+            statusView.text = "Status: reading Health Connect for ${selectedDateRange.displayLabel()}"
             refreshButton.isEnabled = false
             shareButton.isEnabled = false
             copyButton.isEnabled = false
+
+            when (HealthConnectClient.getSdkStatus(this@MainActivity, HEALTH_CONNECT_PROVIDER_PACKAGE)) {
+                HealthConnectClient.SDK_UNAVAILABLE -> {
+                    statusView.text = "Status: Health Connect is unavailable on this device."
+                    refreshButton.isEnabled = false
+                    return@launch
+                }
+
+                HealthConnectClient.SDK_UNAVAILABLE_PROVIDER_UPDATE_REQUIRED -> {
+                    statusView.text = "Status: Health Connect needs to be installed or updated."
+                    refreshButton.isEnabled = false
+                    healthConnectUpdateButton.isEnabled = true
+                    return@launch
+                }
+            }
 
             val client = HealthConnectClient.getOrCreate(this@MainActivity)
             val granted = client.permissionController.getGrantedPermissions()
@@ -221,11 +294,8 @@ class MainActivity : ComponentActivity() {
                 return@launch
             }
 
-            val endTime = Instant.now()
-            val startTime = endTime.minus(Duration.ofDays(7))
-
             try {
-                val snapshot = readSnapshot(client, granted, startTime, endTime)
+                val snapshot = readSnapshot(client, granted, selectedDateRange)
                 renderSnapshot(snapshot)
             } catch (securityException: SecurityException) {
                 statusView.text = "Status: permission was revoked before reading."
@@ -248,9 +318,44 @@ class MainActivity : ComponentActivity() {
     private suspend fun readSnapshot(
         client: HealthConnectClient,
         granted: Set<String>,
-        startTime: Instant,
-        endTime: Instant
+        dateRange: LocalDateRange
     ): HealthSnapshot {
+        val zoneId = ZoneId.systemDefault()
+        val dailyRows = dateRange.dates().map { date ->
+            readDailyRow(client, granted, date, zoneId)
+        }
+
+        return HealthSnapshot(
+            dateRange = dateRange,
+            startTime = dateRange.startInstant(zoneId),
+            endTime = dateRange.endInstant(zoneId),
+            dailyRows = dailyRows,
+            activeAggregateKilocalories = dailyRows.sumDoubleOrNull { it.activeAggregateKilocalories },
+            activeRecordKilocalories = dailyRows.sumOf { it.activeRecordKilocalories },
+            activeRecordCount = dailyRows.sumOf { it.activeRecordCount },
+            totalKilocalories = if (granted.contains(TOTAL_CALORIES_PERMISSION)) {
+                dailyRows.sumDoubleOrNull { it.totalKilocalories }
+            } else {
+                null
+            },
+            totalCaloriesPermissionGranted = granted.contains(TOTAL_CALORIES_PERMISSION),
+            steps = if (granted.contains(STEPS_PERMISSION)) {
+                dailyRows.sumLongOrNull { it.steps }
+            } else {
+                null
+            },
+            stepsPermissionGranted = granted.contains(STEPS_PERMISSION)
+        )
+    }
+
+    private suspend fun readDailyRow(
+        client: HealthConnectClient,
+        granted: Set<String>,
+        date: LocalDate,
+        zoneId: ZoneId
+    ): DailyHealthRow {
+        val startTime = date.atStartOfDay(zoneId).toInstant()
+        val endTime = date.plusDays(1).atStartOfDay(zoneId).toInstant()
         var pageToken: String? = null
         var activeRecordCount = 0
         var activeRecordKilocalories = 0.0
@@ -284,9 +389,8 @@ class MainActivity : ComponentActivity() {
             )
         )
 
-        return HealthSnapshot(
-            startTime = startTime,
-            endTime = endTime,
+        return DailyHealthRow(
+            date = date,
             activeAggregateKilocalories = aggregate[ActiveCaloriesBurnedRecord.ACTIVE_CALORIES_TOTAL]?.inKilocalories,
             activeRecordKilocalories = activeRecordKilocalories,
             activeRecordCount = activeRecordCount,
@@ -295,13 +399,11 @@ class MainActivity : ComponentActivity() {
             } else {
                 null
             },
-            totalCaloriesPermissionGranted = granted.contains(TOTAL_CALORIES_PERMISSION),
             steps = if (granted.contains(STEPS_PERMISSION)) {
                 aggregate[StepsRecord.COUNT_TOTAL]
             } else {
                 null
-            },
-            stepsPermissionGranted = granted.contains(STEPS_PERMISSION)
+            }
         )
     }
 
@@ -324,10 +426,12 @@ class MainActivity : ComponentActivity() {
         }
 
         statusView.text = "Status: read complete"
+        selectedPeriodView.text = "Selected period: ${snapshot.dateRange.displayLabel()}"
         rangeView.text = "Range: ${formatter.format(snapshot.startTime)} to ${formatter.format(snapshot.endTime)}"
         activeCaloriesView.text = "Active calories: $activeText kcal"
         totalCaloriesView.text = "Total calories: $totalText"
         stepsView.text = "Steps: $stepsText"
+        dailyRowsView.text = snapshot.dailyRowsText(includeHeader = true)
         detailView.text = if (snapshot.activeRecordCount == 0) {
             "Details: no ActiveCaloriesBurnedRecord entries found in this range."
         } else {
@@ -453,7 +557,13 @@ class MainActivity : ComponentActivity() {
 
         return """
             Health Connect summary
+            Period: ${dateRange.displayLabel()}
             Range: ${formatter.format(startTime)} to ${formatter.format(endTime)}
+            
+            Daily rows:
+            ${dailyRowsText(includeHeader = false)}
+            
+            Period totals:
             Active calories: $activeText
             Total calories: $totalText
             Steps: $stepsText
@@ -482,7 +592,42 @@ class MainActivity : ComponentActivity() {
     private fun displayFormatter(): DateTimeFormatter =
         DateTimeFormatter.ofPattern("yyyy-MM-dd HH:mm").withZone(ZoneId.systemDefault())
 
+    private fun dateFormatter(): DateTimeFormatter = DateTimeFormatter.ISO_LOCAL_DATE
+
     private fun formatNumber(value: Double): String = "%,.1f".format(value)
+
+    private fun List<DailyHealthRow>.sumDoubleOrNull(selector: (DailyHealthRow) -> Double?): Double? {
+        val values = mapNotNull(selector)
+        return values.takeIf { it.isNotEmpty() }?.sum()
+    }
+
+    private fun List<DailyHealthRow>.sumLongOrNull(selector: (DailyHealthRow) -> Long?): Long? {
+        val values = mapNotNull(selector)
+        return values.takeIf { it.isNotEmpty() }?.sum()
+    }
+
+    private fun HealthSnapshot.dailyRowsText(includeHeader: Boolean): String {
+        val rows = dailyRows.joinToString(separator = "\n") { row ->
+            val active = row.activeAggregateKilocalories?.let { "${formatNumber(it)} kcal" } ?: "0.0 kcal (no data)"
+            val total = when {
+                !totalCaloriesPermissionGranted -> "permission not granted"
+                row.totalKilocalories == null -> "0.0 kcal (no data)"
+                else -> "${formatNumber(row.totalKilocalories)} kcal"
+            }
+            val stepsText = when {
+                !stepsPermissionGranted -> "permission not granted"
+                row.steps == null -> "0 (no data)"
+                else -> "%,d".format(row.steps)
+            }
+            "${dateFormatter().format(row.date)} | active $active | total $total | steps $stepsText | active records ${row.activeRecordCount}"
+        }
+
+        return if (includeHeader) {
+            "Daily rows:\n$rows"
+        } else {
+            rows
+        }
+    }
 
     private data class AppRelease(
         val versionName: String,
@@ -492,8 +637,10 @@ class MainActivity : ComponentActivity() {
     )
 
     private data class HealthSnapshot(
+        val dateRange: LocalDateRange,
         val startTime: Instant,
         val endTime: Instant,
+        val dailyRows: List<DailyHealthRow>,
         val activeAggregateKilocalories: Double?,
         val activeRecordKilocalories: Double,
         val activeRecordCount: Int,
@@ -502,6 +649,60 @@ class MainActivity : ComponentActivity() {
         val steps: Long?,
         val stepsPermissionGranted: Boolean
     )
+
+    private data class DailyHealthRow(
+        val date: LocalDate,
+        val activeAggregateKilocalories: Double?,
+        val activeRecordKilocalories: Double,
+        val activeRecordCount: Int,
+        val totalKilocalories: Double?,
+        val steps: Long?
+    )
+
+    private data class LocalDateRange(
+        val startDate: LocalDate,
+        val endDate: LocalDate
+    ) {
+        fun startInstant(zoneId: ZoneId): Instant = startDate.atStartOfDay(zoneId).toInstant()
+
+        fun endInstant(zoneId: ZoneId): Instant = endDate.plusDays(1).atStartOfDay(zoneId).toInstant()
+
+        fun displayLabel(): String {
+            val formatter = DateTimeFormatter.ISO_LOCAL_DATE
+            return if (startDate == endDate) {
+                formatter.format(startDate)
+            } else {
+                "${formatter.format(startDate)} to ${formatter.format(endDate)}"
+            }
+        }
+
+        fun dates(): List<LocalDate> {
+            val dates = mutableListOf<LocalDate>()
+            var current = startDate
+            while (!current.isAfter(endDate)) {
+                dates += current
+                current = current.plusDays(1)
+            }
+            return dates
+        }
+
+        companion object {
+            fun today(): LocalDateRange {
+                val today = LocalDate.now()
+                return LocalDateRange(today, today)
+            }
+
+            fun yesterday(): LocalDateRange {
+                val yesterday = LocalDate.now().minusDays(1)
+                return LocalDateRange(yesterday, yesterday)
+            }
+
+            fun lastDays(days: Long): LocalDateRange {
+                val today = LocalDate.now()
+                return LocalDateRange(today.minusDays(days - 1), today)
+            }
+        }
+    }
 
     private companion object {
         private const val HEALTH_CONNECT_PROVIDER_PACKAGE = "com.google.android.apps.healthdata"

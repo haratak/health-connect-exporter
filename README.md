@@ -4,11 +4,17 @@ Minimal Android app for verifying that Health Connect data can be retrieved from
 
 ## What It Reads
 
-- `ActiveCaloriesBurnedRecord` for active calories over the last 7 days.
+- `ActiveCaloriesBurnedRecord` for active calories over the selected period.
 - `TotalCaloriesBurnedRecord` if the user grants the optional total calories permission.
 - `StepsRecord` if the user grants the optional steps permission.
 
-The app shows the queried time range, aggregate totals, the number of active calorie records read, and clear unavailable, permission, no-data, and error states.
+The app shows the selected local-date period, queried time range, daily rows, aggregate period totals, the number of active calorie records read, and clear unavailable, permission, no-data, and error states. Days without Health Connect data are still shown as explicit zero/no-data rows.
+
+## Period Selection
+
+Use the period buttons to choose `Today`, `Yesterday`, `Last 7 days`, or `Last 30 days`. Tap `Custom date range` to choose a start date and end date with native Android date pickers.
+
+Daily reads use local calendar-day boundaries on the device. A selected date covers midnight at the start of that local date through midnight at the start of the next local date.
 
 ## App Updates
 
@@ -24,7 +30,7 @@ The repository is public so installed APKs can check release metadata and downlo
 
 ## Sharing
 
-After `Refresh last 7 days` succeeds, tap `Share latest summary` to send the displayed range, active calories, total calories, steps, and active calorie record count through Android Sharesheet. Discord can be selected there when it is installed. Tap `Copy latest summary` to place the same text on the clipboard.
+After `Refresh selected period` succeeds, tap `Share latest summary` to send the selected period, queried range, day-by-day active calories, total calories, steps, active calorie record counts, and period totals through Android Sharesheet. Discord can be selected there when it is installed. Tap `Copy latest summary` to place the same day-by-day text on the clipboard.
 
 Sharing is always user-initiated. The app does not automatically upload, sync, or post Health Connect data.
 
@@ -74,7 +80,7 @@ app/build/outputs/apk/release/app-release.apk
 3. If prompted, install or update Health Connect.
 4. Tap `Request Health Connect permissions`.
 5. Grant at least active calories. Total calories and steps are useful but optional.
-6. Tap `Refresh last 7 days`.
+6. Choose a period preset or custom date range, then tap `Refresh selected period`.
 
 If the app reports no data, confirm that another app has written active calorie data to Health Connect in the queried period.
 
@@ -89,7 +95,7 @@ To download it:
 3. Open the latest `Android APK` workflow run.
 4. Download the `health-connect-exporter-debug-apk` artifact.
 
-For release updates, push a version tag such as `v0.2.1`. The same workflow reconstructs the release keystore from GitHub Secrets, runs `assembleRelease`, and creates or updates a GitHub Release with an APK named like `health-connect-exporter-v0.2.1-release.apk`.
+For release updates, push a version tag such as `v0.2.2`. The same workflow reconstructs the release keystore from GitHub Secrets, runs `assembleRelease`, and creates or updates a GitHub Release with an APK named like `health-connect-exporter-v0.2.2-release.apk`.
 
 Release APKs are signed with the app's release key, not the Android debug key. Android will allow sideloaded updates only when the installed app and the update APK have the same application ID and signing certificate. If a device has a previous debug-signed build installed, uninstall it before installing the release-signed APK; after that, future release APKs signed with the same release key can update in place.
 
