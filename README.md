@@ -24,7 +24,9 @@ The app includes a GitHub Releases based update check. Tap `Check for app update
 https://github.com/haratak/health-connect-exporter/releases/latest
 ```
 
-If a newer release with an APK asset is available, tap `Open latest APK download`. Android opens the GitHub-hosted APK URL in the browser/download flow, then the OS asks the user to confirm installation. The app does not silently install updates, bypass Android install prompts, or embed GitHub tokens.
+If a newer release with an APK asset is available, tap `Download and install update`. The app downloads the GitHub-hosted APK into its cache, shows download progress when the server provides a content length, and hands the downloaded APK to Android's package installer using a secure `content://` URI. Android still asks the user to confirm installation.
+
+On Android 8 or newer, the system may require you to allow Health Connect Exporter to install unknown apps before the installer opens. If needed, the app opens the relevant Android settings screen after the APK is downloaded; return to the app and tap `Download and install update` again to start the installer. The app does not silently install updates, bypass Android install prompts, expose `file://` APK URIs, or embed GitHub tokens.
 
 The repository is public so installed APKs can check release metadata and download release assets without credentials. GitHub Actions artifacts are still uploaded for CI convenience, but release APKs are the durable update source because artifacts expire and private artifacts require authentication.
 
@@ -95,7 +97,7 @@ To download it:
 3. Open the latest `Android APK` workflow run.
 4. Download the `health-connect-exporter-debug-apk` artifact.
 
-For release updates, push a version tag such as `v0.2.2`. The same workflow reconstructs the release keystore from GitHub Secrets, runs `assembleRelease`, and creates or updates a GitHub Release with an APK named like `health-connect-exporter-v0.2.2-release.apk`.
+For release updates, push a version tag such as `v0.2.3`. The same workflow reconstructs the release keystore from GitHub Secrets, runs `assembleRelease`, and creates or updates a GitHub Release with an APK named like `health-connect-exporter-v0.2.3-release.apk`.
 
 Release APKs are signed with the app's release key, not the Android debug key. Android will allow sideloaded updates only when the installed app and the update APK have the same application ID and signing certificate. If a device has a previous debug-signed build installed, uninstall it before installing the release-signed APK; after that, future release APKs signed with the same release key can update in place.
 

@@ -1,12 +1,15 @@
 package dev.harataku.healthconnectexporter
 
 import android.app.DatePickerDialog
+import android.content.ActivityNotFoundException
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.provider.Settings
 import android.view.Gravity
 import android.view.ViewGroup
 import android.widget.Button
@@ -15,6 +18,7 @@ import android.widget.ScrollView
 import android.widget.TextView
 import androidx.activity.ComponentActivity
 import androidx.activity.result.ActivityResultLauncher
+import androidx.core.content.FileProvider
 import androidx.core.view.ViewCompat
 import androidx.core.view.WindowInsetsCompat
 import androidx.health.connect.client.HealthConnectClient
@@ -27,9 +31,11 @@ import androidx.health.connect.client.request.AggregateRequest
 import androidx.health.connect.client.request.ReadRecordsRequest
 import androidx.health.connect.client.time.TimeRangeFilter
 import androidx.lifecycle.lifecycleScope
+import java.io.File
 import java.io.IOException
 import java.net.HttpURLConnection
 import java.net.URL
+import java.security.MessageDigest
 import java.time.Instant
 import java.time.LocalDate
 import java.time.ZoneId
@@ -60,6 +66,8 @@ class MainActivity : ComponentActivity() {
     private lateinit var openAppUpdateButton: Button
     private var latestSnapshot: HealthSnapshot? = null
     private var latestRelease: AppRelease? = null
+    private var downloadedUpdateApk: File? = null
+    private var isAppUpdateDownloadRunning: Boolean = false
     private var selectedDateRange: LocalDateRange = LocalDateRange.lastDays(7)
 
     override fun onCreate(savedInstanceState: Bundle?) {
@@ -136,8 +144,8 @@ class MainActivity : ComponentActivity() {
         checkAppUpdateButton = content.button("Check for app update") {
             checkForAppUpdate()
         }
-        openAppUpdateButton = content.button("Open latest APK download") {
-            openLatestAppUpdate()
+        openAppUpdateButton = content.button("Download and install update") {
+            downloadAndInstallLatestAppUpdate()
         }
 
         shareButton.isEnabled = false
@@ -463,6 +471,7 @@ class MainActivity : ComponentActivity() {
             updateStatusView.text = "App update: checking GitHub Releases"
             checkAppUpdateButton.isEnabled = false
             openAppUpdateButton.isEnabled = false
+            downloadedUpdateApk = null
 
             runCatching { fetchLatestRelease() }
                 .onSuccess { release ->
@@ -473,7 +482,7 @@ class MainActivity : ComponentActivity() {
                         comparison == 0 -> "App update: ${release.versionName} is the current version."
                         else -> "App update: latest release ${release.versionName} is older than this build (${BuildConfig.VERSION_NAME})."
                     }
-                    openAppUpdateButton.isEnabled = comparison > 0 && release.apkUrl.isNotBlank()
+                    openAppUpdateButton.isEnabled = comparison > 0 && release.apkUrl.isNotBlank() && !isAppUpdateDownloadRunning
                 }
                 .onFailure { error ->
                     latestRelease = null
@@ -511,17 +520,162 @@ class MainActivity : ComponentActivity() {
                 versionName = json.optString("tag_name").removePrefix("v"),
                 releaseUrl = json.optString("html_url"),
                 apkUrl = apkAsset.optString("browser_download_url"),
-                apkName = apkAsset.optString("name")
+                apkName = apkAsset.optString("name"),
+                apkDigest = apkAsset.optString("digest").takeIf { it.isNotBlank() }
             )
         } finally {
             connection.disconnect()
         }
     }
 
-    private fun openLatestAppUpdate() {
+    private fun downloadAndInstallLatestAppUpdate() {
         val release = latestRelease ?: return
-        val url = release.apkUrl.ifBlank { release.releaseUrl }
-        startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+        val existingApk = downloadedUpdateApk
+        if (existingApk != null && existingApk.isFile) {
+            startPackageInstaller(existingApk, release)
+            return
+        }
+        if (isAppUpdateDownloadRunning) {
+            return
+        }
+
+        lifecycleScope.launch {
+            isAppUpdateDownloadRunning = true
+            openAppUpdateButton.isEnabled = false
+            checkAppUpdateButton.isEnabled = false
+            updateStatusView.text = "App update: downloading ${release.apkName}"
+
+            runCatching { downloadReleaseApk(release) }
+                .onSuccess { apkFile ->
+                    downloadedUpdateApk = apkFile
+                    updateStatusView.text = "App update: downloaded ${release.apkName}. Opening Android installer."
+                    startPackageInstaller(apkFile, release)
+                }
+                .onFailure { error ->
+                    downloadedUpdateApk = null
+                    updateStatusView.text = "App update: download failed (${error.message ?: error.javaClass.simpleName})."
+                }
+
+            isAppUpdateDownloadRunning = false
+            checkAppUpdateButton.isEnabled = true
+            openAppUpdateButton.isEnabled = latestRelease == release
+        }
+    }
+
+    private suspend fun downloadReleaseApk(release: AppRelease): File = withContext(Dispatchers.IO) {
+        val updateDirectory = File(cacheDir, APK_UPDATE_CACHE_DIRECTORY).apply {
+            mkdirs()
+        }
+        updateDirectory.listFiles()?.forEach { file ->
+            if (file.isFile && file.extension.equals("apk", ignoreCase = true)) {
+                file.delete()
+            }
+        }
+
+        val targetFile = File(updateDirectory, release.apkName.safeApkFileName())
+        val temporaryFile = File(updateDirectory, "${targetFile.name}.download")
+        val digest = MessageDigest.getInstance("SHA-256")
+
+        val connection = (URL(release.apkUrl).openConnection() as HttpURLConnection).apply {
+            requestMethod = "GET"
+            connectTimeout = 15_000
+            readTimeout = 30_000
+            setRequestProperty("Accept", "application/octet-stream")
+            setRequestProperty("User-Agent", "HealthConnectExporter/${BuildConfig.VERSION_NAME}")
+        }
+
+        try {
+            val responseCode = connection.responseCode
+            if (responseCode !in 200..299) {
+                throw IOException("download returned HTTP $responseCode")
+            }
+
+            val contentLength = connection.contentLengthLong
+            var downloadedBytes = 0L
+            val buffer = ByteArray(DEFAULT_BUFFER_SIZE)
+            connection.inputStream.use { input ->
+                temporaryFile.outputStream().use { output ->
+                    while (true) {
+                        val read = input.read(buffer)
+                        if (read == -1) {
+                            break
+                        }
+                        output.write(buffer, 0, read)
+                        digest.update(buffer, 0, read)
+                        downloadedBytes += read
+                        if (contentLength > 0) {
+                            val percent = ((downloadedBytes * 100) / contentLength).coerceIn(0, 100)
+                            withContext(Dispatchers.Main) {
+                                updateStatusView.text = "App update: downloading ${release.apkName} ($percent%)."
+                            }
+                        } else {
+                            withContext(Dispatchers.Main) {
+                                updateStatusView.text = "App update: downloading ${release.apkName} (${downloadedBytes.toHumanSize()})."
+                            }
+                        }
+                    }
+                }
+            }
+
+            val expectedSha256 = release.apkDigest?.removePrefix("sha256:")
+            if (!expectedSha256.isNullOrBlank()) {
+                val actualSha256 = digest.digest().toHexString()
+                if (!actualSha256.equals(expectedSha256, ignoreCase = true)) {
+                    temporaryFile.delete()
+                    throw IOException("downloaded APK SHA-256 did not match GitHub release metadata")
+                }
+            }
+
+            if (targetFile.exists()) {
+                targetFile.delete()
+            }
+            if (!temporaryFile.renameTo(targetFile)) {
+                temporaryFile.copyTo(targetFile, overwrite = true)
+                temporaryFile.delete()
+            }
+            targetFile
+        } finally {
+            connection.disconnect()
+            if (temporaryFile.exists()) {
+                temporaryFile.delete()
+            }
+        }
+    }
+
+    private fun startPackageInstaller(apkFile: File, release: AppRelease) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O && !packageManager.canRequestPackageInstalls()) {
+            updateStatusView.text = "App update: downloaded ${release.versionName}. Allow this app to install unknown apps, then tap Download and install update again."
+            openUnknownAppInstallSettings()
+            return
+        }
+
+        val apkUri = FileProvider.getUriForFile(this, "$packageName.apkprovider", apkFile)
+        val installIntent = Intent(Intent.ACTION_VIEW).apply {
+            setDataAndType(apkUri, APK_MIME_TYPE)
+            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        }
+
+        try {
+            startActivity(installIntent)
+        } catch (exception: ActivityNotFoundException) {
+            updateStatusView.text = "App update: Android package installer was not available (${exception.message ?: "ActivityNotFoundException"})."
+        }
+    }
+
+    private fun openUnknownAppInstallSettings() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.O) {
+            return
+        }
+        val settingsIntent = Intent(
+            Settings.ACTION_MANAGE_UNKNOWN_APP_SOURCES,
+            Uri.parse("package:$packageName")
+        )
+        try {
+            startActivity(settingsIntent)
+        } catch (_: ActivityNotFoundException) {
+            startActivity(Intent(Settings.ACTION_SECURITY_SETTINGS))
+        }
     }
 
     private fun shareLatestSnapshot() {
@@ -596,6 +750,21 @@ class MainActivity : ComponentActivity() {
 
     private fun formatNumber(value: Double): String = "%,.1f".format(value)
 
+    private fun String.safeApkFileName(): String {
+        val sanitized = replace(Regex("[^A-Za-z0-9._-]"), "_")
+        return sanitized.takeIf { it.endsWith(".apk", ignoreCase = true) } ?: "health-connect-exporter-update.apk"
+    }
+
+    private fun Long.toHumanSize(): String =
+        if (this >= 1_048_576L) {
+            "%.1f MB".format(this / 1_048_576.0)
+        } else {
+            "%.1f KB".format(this / 1_024.0)
+        }
+
+    private fun ByteArray.toHexString(): String =
+        joinToString(separator = "") { byte -> "%02x".format(byte) }
+
     private fun List<DailyHealthRow>.sumDoubleOrNull(selector: (DailyHealthRow) -> Double?): Double? {
         val values = mapNotNull(selector)
         return values.takeIf { it.isNotEmpty() }?.sum()
@@ -633,7 +802,8 @@ class MainActivity : ComponentActivity() {
         val versionName: String,
         val releaseUrl: String,
         val apkUrl: String,
-        val apkName: String
+        val apkName: String,
+        val apkDigest: String?
     )
 
     private data class HealthSnapshot(
@@ -707,6 +877,8 @@ class MainActivity : ComponentActivity() {
     private companion object {
         private const val HEALTH_CONNECT_PROVIDER_PACKAGE = "com.google.android.apps.healthdata"
         private const val LATEST_RELEASE_API_URL = "https://api.github.com/repos/haratak/health-connect-exporter/releases/latest"
+        private const val APK_UPDATE_CACHE_DIRECTORY = "apk-updates"
+        private const val APK_MIME_TYPE = "application/vnd.android.package-archive"
         private val ACTIVE_CALORIES_PERMISSION = HealthPermission.getReadPermission(ActiveCaloriesBurnedRecord::class)
         private val TOTAL_CALORIES_PERMISSION = HealthPermission.getReadPermission(TotalCaloriesBurnedRecord::class)
         private val STEPS_PERMISSION = HealthPermission.getReadPermission(StepsRecord::class)
